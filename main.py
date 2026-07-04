@@ -1,4 +1,4 @@
-from bilibili_live_helper.service import main
+from src.service import main
 
 
 if __name__ == "__main__":
