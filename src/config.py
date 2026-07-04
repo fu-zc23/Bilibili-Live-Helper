@@ -7,7 +7,7 @@ from .utils import load_json, normalize_messages
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="简洁版 B 站直播间点赞/发弹幕脚本")
+    parser = argparse.ArgumentParser(description="简洁版 B 站直播间亲密度任务脚本")
     parser.add_argument(
         "--config",
         default="live_helper_config.json",
@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--like-click-time", type=int, help="兼容旧配置，表示每次请求点赞数")
     parser.add_argument("--like-count", type=int, help="点赞总次数")
     parser.add_argument("--like-batch-size", type=int, help="每次请求点赞数，建议 1-10")
+    parser.add_argument("--watch-minutes", type=int, help="每个开播房间观看多少分钟，0 表示关闭")
     parser.add_argument("--login", action="store_true", help="强制执行扫码登录并保存 Cookie")
     parser.add_argument(
         "--run-after-login",
@@ -44,6 +45,8 @@ def load_config_from_args(args: argparse.Namespace) -> dict:
         config["like_count"] = args.like_count
     if args.like_batch_size is not None:
         config["like_batch_size"] = args.like_batch_size
+    if args.watch_minutes is not None:
+        config["watch_minutes"] = args.watch_minutes
 
     return config
 
@@ -59,6 +62,7 @@ def parse_task_config(config: dict) -> TaskConfig:
         like_batch_size=int(config.get("like_batch_size", config.get("like_click_time", 10))),
         like_interval_min=float(config.get("like_interval_min", 1.5)),
         like_interval_max=float(config.get("like_interval_max", 3)),
+        watch_minutes=int(config.get("watch_minutes", 15)),
     )
 
 
@@ -67,6 +71,8 @@ def validate_task_config(task_config: TaskConfig) -> None:
         raise BiliLiveError("danmaku_count 不能小于 0")
     if task_config.like_count < 0:
         raise BiliLiveError("like_count 不能小于 0")
+    if task_config.watch_minutes < 0:
+        raise BiliLiveError("watch_minutes 不能小于 0")
     if task_config.like_batch_size <= 0:
         raise BiliLiveError("like_batch_size 必须大于 0")
     if task_config.danmaku_count > 0 and not task_config.danmaku_messages:

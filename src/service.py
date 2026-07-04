@@ -2,14 +2,21 @@ from pathlib import Path
 import random
 import sys
 import time
+import uuid
 
 import requests
 
 from .client import BiliLiveClient
 from .config import build_parser, load_config_from_args, parse_task_config, validate_task_config
-from .constants import DUMMY_COOKIE
+from .constants import (
+    DUMMY_COOKIE,
+    WATCH_FAILURE_THRESHOLD,
+    WATCH_HEARTBEAT_INTERVAL,
+    WATCH_LOG_INTERVAL,
+    WATCH_REQUEST_GAP,
+)
 from .exceptions import BiliLiveError
-from .models import TaskConfig
+from .models import TaskConfig, TargetRoom, WatchState
 from .utils import choose_message, save_json
 
 
@@ -83,6 +90,135 @@ class BiliLiveService:
             print(f"[INFO] 等待 {wait_seconds:.1f} 秒后继续点赞")
             time.sleep(wait_seconds)
 
+    def watch_live_rooms(self, targets: list[TargetRoom], watch_minutes: int) -> tuple[int, int]:
+        live_targets = [
+            target
+            for target in targets
+            if target.is_living and target.live_key and target.sub_session_key and target.play_url
+        ]
+        if watch_minutes <= 0:
+            return 0, 0
+        skipped_targets = [
+            target
+            for target in targets
+            if target.is_living and target not in live_targets
+        ]
+        for target in skipped_targets:
+            print(
+                f"[WARN] 房间 {target.room_id} 缺少观看链路参数，跳过挂机 "
+                f"(live_key={bool(target.live_key)}, sub_session_key={bool(target.sub_session_key)}, "
+                f"play_url={bool(target.play_url)})"
+            )
+        if not live_targets:
+            print("[WARN] 当前没有开播房间，跳过观看任务")
+            return 0, 0
+
+        device_id = self.client.get_live_buvid()
+        states = [
+            WatchState(
+                target=target,
+                device_id=device_id,
+                session_uuid=str(uuid.uuid4()),
+                player_guid=str(uuid.uuid4()),
+                player_session_id=uuid.uuid4().hex[:11],
+            )
+            for target in live_targets
+        ]
+        print(
+            f"[INFO] 开始直播间观看任务，共 {len(states)} 个开播房间，"
+            f"每个房间挂机 {watch_minutes} 分钟"
+        )
+
+        for state in states:
+            try:
+                response = self.client.enter_room_heartbeat(
+                    state.target,
+                    device_id=state.device_id,
+                    seq_id=0,
+                    session_uuid=state.session_uuid,
+                )
+                state.timestamp = int(response.get("timestamp", 0) or 0)
+                state.secret_key = str(response.get("secret_key", "") or "")
+                state.secret_rule = [int(rule) for rule in (response.get("secret_rule") or [])]
+                print(f"[OK] 初始化观看会话: {state.target.target_name} 房间 {state.target.room_id}")
+            except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
+                state.failed_times += 1
+                print(f"[WARN] 初始化观看会话失败: {state.target.target_name} 房间 {state.target.room_id} - {exc}")
+
+        total_rounds = watch_minutes * int(WATCH_HEARTBEAT_INTERVAL / WATCH_LOG_INTERVAL)
+        for round_index in range(total_rounds):
+            active_states = [
+                state
+                for state in states
+                if state.failed_times < WATCH_FAILURE_THRESHOLD
+                and state.timestamp > 0
+                and state.secret_key
+                and state.secret_rule
+            ]
+            if not active_states:
+                print("[WARN] 所有房间的观看链路都已连续失败，提前结束观看任务")
+                break
+
+            round_start = time.monotonic()
+            for state_index, state in enumerate(active_states, start=1):
+                try:
+                    next_watch_seconds = state.watch_seconds + int(WATCH_LOG_INTERVAL)
+                    self.client.report_watch_log(
+                        state.target,
+                        player_guid=state.player_guid,
+                        player_session_id=state.player_session_id,
+                        watch_seconds=next_watch_seconds,
+                    )
+                    state.watch_seconds = next_watch_seconds
+                    if state.watch_seconds % int(WATCH_HEARTBEAT_INTERVAL) == 0:
+                        response = self.client.send_watch_heartbeat(
+                            state.target,
+                            device_id=state.device_id,
+                            seq_id=state.heartbeat_count + 1,
+                            session_uuid=state.session_uuid,
+                            timestamp=state.timestamp,
+                            secret_key=state.secret_key,
+                            secret_rule=state.secret_rule,
+                        )
+                        state.timestamp = int(response.get("timestamp", 0) or 0)
+                        state.secret_key = str(response.get("secret_key", "") or "")
+                        state.secret_rule = [
+                            int(rule)
+                            for rule in (response.get("secret_rule") or [])
+                        ]
+                        state.heartbeat_count += 1
+                        print(
+                            f"[OK] 观看心跳 {state.heartbeat_count}/{watch_minutes}: "
+                            f"{state.target.target_name} 房间 {state.target.room_id} "
+                            f"(累计 {state.watch_seconds // 60} 分钟)"
+                        )
+
+                    state.failed_times = 0
+                except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
+                    state.failed_times += 1
+                    print(
+                        f"[WARN] 观看上报失败: {state.target.target_name} 房间 {state.target.room_id} "
+                        f"({state.failed_times}/{WATCH_FAILURE_THRESHOLD}) - {exc}"
+                    )
+
+                if state_index < len(active_states):
+                    time.sleep(WATCH_REQUEST_GAP)
+
+            if round_index + 1 < total_rounds:
+                elapsed = time.monotonic() - round_start
+                wait_seconds = max(0.0, WATCH_LOG_INTERVAL - elapsed)
+                time.sleep(wait_seconds)
+
+        finished_rooms = sum(
+            1 for state in states if state.watch_seconds >= watch_minutes * 60
+        )
+        total_reports = sum((state.watch_seconds // int(WATCH_LOG_INTERVAL)) + state.heartbeat_count for state in states)
+        print(
+            f"[INFO] 观看任务完成，达成 {finished_rooms}/{len(states)} 个房间，"
+            f"共发送 {total_reports} 次观看上报"
+        )
+        return finished_rooms, total_reports
+
     def run(self, task_config: TaskConfig) -> None:
         self.client.ensure_main_site_cookie()
         self.client.ensure_live_cookie()
@@ -97,6 +233,8 @@ class BiliLiveService:
 
         total_like_success = 0
         total_danmaku_success = 0
+        total_watch_reports = 0
+        watched_rooms = 0
         for target_index, target in enumerate(targets, start=1):
             room_like_success = 0
             room_status = "开播中" if target.is_living else "未开播"
@@ -139,13 +277,23 @@ class BiliLiveService:
                 f"点赞 {room_like_success} 次，弹幕 {room_danmaku_success} 条"
             )
 
-        if task_config.danmaku_count == 0 and task_config.like_count <= 0:
+        watched_rooms, total_watch_reports = self.watch_live_rooms(
+            targets,
+            task_config.watch_minutes,
+        )
+
+        if (
+            task_config.danmaku_count == 0
+            and task_config.like_count <= 0
+            and task_config.watch_minutes <= 0
+        ):
             print("[WARN] 当前配置未执行任何操作")
             return
 
         print(
             f"[DONE] 全部任务完成，处理直播间 {len(targets)} 个，"
-            f"成功点赞 {total_like_success} 次，成功发送弹幕 {total_danmaku_success} 条"
+            f"成功点赞 {total_like_success} 次，成功发送弹幕 {total_danmaku_success} 条，"
+            f"观看完成 {watched_rooms} 个房间 / {total_watch_reports} 次上报"
         )
 
 
