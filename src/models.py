@@ -28,6 +28,7 @@ class TaskConfig:
     like_interval_min: float
     like_interval_max: float
     watch_minutes: int
+    watch_session_minutes: int
 
 
 @dataclass

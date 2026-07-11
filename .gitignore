@@ -1,2 +1,4 @@
 __pycache__/
 live_helper_config.json
+task_state.json
+*.log

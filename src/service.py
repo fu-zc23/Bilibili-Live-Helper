@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 import random
 import sys
@@ -17,7 +18,69 @@ from .constants import (
 )
 from .exceptions import BiliLiveError
 from .models import TaskConfig, TargetRoom, WatchState
-from .utils import choose_message, save_json
+from .utils import choose_message, load_json, save_json
+
+
+class DailyTaskStateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.date = datetime.now().astimezone().date().isoformat()
+        self.rooms: dict[str, dict[str, bool | int]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        data = load_json(self.path)
+        if data.get("date") != self.date:
+            return
+        rooms = data.get("rooms")
+        if not isinstance(rooms, dict):
+            return
+        normalized: dict[str, dict[str, bool | int]] = {}
+        for room_id, state in rooms.items():
+            if not isinstance(state, dict):
+                continue
+            normalized[str(room_id)] = {
+                "like_done": bool(state.get("like_done", False)),
+                "danmaku_done": bool(state.get("danmaku_done", False)),
+                "watch_minutes": max(0, int(state.get("watch_minutes", 0) or 0)),
+            }
+        self.rooms = normalized
+
+    def _room_state(self, room_id: int) -> dict[str, bool | int]:
+        key = str(room_id)
+        if key not in self.rooms:
+            self.rooms[key] = {
+                "like_done": False,
+                "danmaku_done": False,
+                "watch_minutes": 0,
+            }
+        return self.rooms[key]
+
+    def is_done(self, room_id: int, task_name: str) -> bool:
+        return bool(self._room_state(room_id).get(task_name, False))
+
+    def mark_done(self, room_id: int, task_name: str) -> None:
+        self._room_state(room_id)[task_name] = True
+        self.save()
+
+    def get_watch_minutes(self, room_id: int) -> int:
+        return int(self._room_state(room_id).get("watch_minutes", 0) or 0)
+
+    def add_watch_minutes(self, room_id: int, minutes: int) -> None:
+        room_state = self._room_state(room_id)
+        room_state["watch_minutes"] = self.get_watch_minutes(room_id) + max(0, minutes)
+        self.save()
+
+    def save(self) -> None:
+        save_json(
+            self.path,
+            {
+                "date": self.date,
+                "rooms": self.rooms,
+            },
+        )
 
 
 def login_and_update_config(
@@ -63,8 +126,35 @@ def ensure_login_cookie(
 
 
 class BiliLiveService:
-    def __init__(self, client: BiliLiveClient) -> None:
+    def __init__(self, client: BiliLiveClient, state_store: DailyTaskStateStore) -> None:
         self.client = client
+        self.state_store = state_store
+
+    @staticmethod
+    def _is_time_check_failed(exc: Exception) -> bool:
+        return "time check failed" in str(exc).lower()
+
+    def refresh_watch_session(self, state: WatchState, *, action: str) -> bool:
+        try:
+            response = self.client.enter_room_heartbeat(
+                state.target,
+                device_id=state.device_id,
+                seq_id=state.heartbeat_count,
+                session_uuid=state.session_uuid,
+            )
+            state.timestamp = int(response.get("timestamp", 0) or 0)
+            state.secret_key = str(response.get("secret_key", "") or "")
+            state.secret_rule = [int(rule) for rule in (response.get("secret_rule") or [])]
+            state.failed_times = 0
+            print(f"[OK] {action}观看会话: {state.target.target_name} 房间 {state.target.room_id}")
+            return True
+        except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
+            state.failed_times += 1
+            print(
+                f"[WARN] {action}观看会话失败: {state.target.target_name} 房间 {state.target.room_id} "
+                f"({state.failed_times}/{WATCH_FAILURE_THRESHOLD}) - {exc}"
+            )
+            return False
 
     def like_room_multiple(
         self,
@@ -90,13 +180,122 @@ class BiliLiveService:
             print(f"[INFO] 等待 {wait_seconds:.1f} 秒后继续点赞")
             time.sleep(wait_seconds)
 
-    def watch_live_rooms(self, targets: list[TargetRoom], watch_minutes: int) -> tuple[int, int]:
+    def watch_room(
+        self,
+        target: TargetRoom,
+        session_minutes: int,
+        watched_today: int,
+        daily_target_minutes: int,
+    ) -> tuple[int, int]:
+        if session_minutes <= 0:
+            return 0, 0
+
+        state = WatchState(
+            target=target,
+            device_id=self.client.get_live_buvid(),
+            session_uuid=str(uuid.uuid4()),
+            player_guid=str(uuid.uuid4()),
+            player_session_id=uuid.uuid4().hex[:11],
+        )
+        print(
+            f"[INFO] 开始观看房间 {target.room_id}，"
+            f"本轮计划 {session_minutes} 分钟，今日已看 {watched_today}/{daily_target_minutes} 分钟"
+        )
+
+        if not self.refresh_watch_session(state, action="初始化"):
+            return 0, 0
+
+        total_rounds = session_minutes * int(WATCH_HEARTBEAT_INTERVAL / WATCH_LOG_INTERVAL)
+        for round_index in range(total_rounds):
+            if (
+                state.failed_times >= WATCH_FAILURE_THRESHOLD
+                or state.timestamp <= 0
+                or not state.secret_key
+                or not state.secret_rule
+            ):
+                print(f"[WARN] 房间 {state.target.room_id} 观看链路连续失败，提前结束本房间观看")
+                break
+
+            round_start = time.monotonic()
+            try:
+                next_watch_seconds = state.watch_seconds + int(WATCH_LOG_INTERVAL)
+                self.client.report_watch_log(
+                    state.target,
+                    player_guid=state.player_guid,
+                    player_session_id=state.player_session_id,
+                    watch_seconds=next_watch_seconds,
+                )
+                state.watch_seconds = next_watch_seconds
+                state.failed_times = 0
+            except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
+                state.failed_times += 1
+                print(
+                    f"[WARN] 播放日志上报失败: {state.target.target_name} 房间 {state.target.room_id} "
+                    f"({state.failed_times}/{WATCH_FAILURE_THRESHOLD}) - {exc}"
+                )
+                time.sleep(min(WATCH_REQUEST_GAP * 2, WATCH_LOG_INTERVAL))
+                continue
+
+            if state.watch_seconds % int(WATCH_HEARTBEAT_INTERVAL) == 0:
+                try:
+                    response = self.client.send_watch_heartbeat(
+                        state.target,
+                        device_id=state.device_id,
+                        seq_id=state.heartbeat_count + 1,
+                        session_uuid=state.session_uuid,
+                        timestamp=state.timestamp,
+                        secret_key=state.secret_key,
+                        secret_rule=state.secret_rule,
+                    )
+                    state.timestamp = int(response.get("timestamp", 0) or 0)
+                    state.secret_key = str(response.get("secret_key", "") or "")
+                    state.secret_rule = [
+                        int(rule)
+                        for rule in (response.get("secret_rule") or [])
+                    ]
+                    state.heartbeat_count += 1
+                    state.failed_times = 0
+                    print(
+                        f"[OK] 观看心跳 {watched_today + state.heartbeat_count}/{daily_target_minutes}: "
+                        f"{state.target.target_name} 房间 {state.target.room_id} "
+                        f"(本轮 {state.heartbeat_count} 分钟，今日累计 {watched_today + state.heartbeat_count} 分钟)"
+                    )
+                except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
+                    state.failed_times += 1
+                    print(
+                        f"[WARN] 观看心跳失败: {state.target.target_name} 房间 {state.target.room_id} "
+                        f"({state.failed_times}/{WATCH_FAILURE_THRESHOLD}) - {exc}"
+                    )
+                    if self._is_time_check_failed(exc):
+                        self.refresh_watch_session(state, action="重建")
+
+            if round_index + 1 < total_rounds:
+                elapsed = time.monotonic() - round_start
+                wait_seconds = max(0.0, WATCH_LOG_INTERVAL - elapsed)
+                time.sleep(wait_seconds)
+
+        watched_minutes = state.heartbeat_count
+        total_reports = (state.watch_seconds // int(WATCH_LOG_INTERVAL)) + state.heartbeat_count
+        if watched_minutes > 0:
+            self.state_store.add_watch_minutes(target.room_id, watched_minutes)
+        print(
+            f"[INFO] 房间 {target.room_id} 本轮观看结束，"
+            f"新增 {watched_minutes} 分钟，今日累计 {watched_today + watched_minutes}/{daily_target_minutes} 分钟"
+        )
+        return watched_minutes, total_reports
+
+    def watch_live_rooms(
+        self,
+        targets: list[TargetRoom],
+        daily_target_minutes: int,
+        session_minutes: int,
+    ) -> tuple[int, int]:
         live_targets = [
             target
             for target in targets
             if target.is_living and target.live_key and target.sub_session_key and target.play_url
         ]
-        if watch_minutes <= 0:
+        if daily_target_minutes <= 0 or session_minutes <= 0:
             return 0, 0
         skipped_targets = [
             target
@@ -113,111 +312,43 @@ class BiliLiveService:
             print("[WARN] 当前没有开播房间，跳过观看任务")
             return 0, 0
 
-        device_id = self.client.get_live_buvid()
-        states = [
-            WatchState(
-                target=target,
-                device_id=device_id,
-                session_uuid=str(uuid.uuid4()),
-                player_guid=str(uuid.uuid4()),
-                player_session_id=uuid.uuid4().hex[:11],
-            )
-            for target in live_targets
-        ]
-        print(
-            f"[INFO] 开始直播间观看任务，共 {len(states)} 个开播房间，"
-            f"每个房间挂机 {watch_minutes} 分钟"
+        ranked_targets = sorted(
+            enumerate(live_targets),
+            key=lambda item: (self.state_store.get_watch_minutes(item[1].room_id), item[0]),
         )
-
-        for state in states:
-            try:
-                response = self.client.enter_room_heartbeat(
-                    state.target,
-                    device_id=state.device_id,
-                    seq_id=0,
-                    session_uuid=state.session_uuid,
+        watched_rooms = 0
+        total_reports = 0
+        print(
+            f"[INFO] 开始直播间观看任务，共 {len(live_targets)} 个开播房间，"
+            f"每房间当天目标 {daily_target_minutes} 分钟，单次运行最多连续观看 {session_minutes} 分钟"
+        )
+        for _, target in ranked_targets:
+            watched_today = self.state_store.get_watch_minutes(target.room_id)
+            if watched_today >= daily_target_minutes:
+                print(
+                    f"[INFO] 房间 {target.room_id} 今日已观看 {watched_today} 分钟，"
+                    "达到今日目标，跳过"
                 )
-                state.timestamp = int(response.get("timestamp", 0) or 0)
-                state.secret_key = str(response.get("secret_key", "") or "")
-                state.secret_rule = [int(rule) for rule in (response.get("secret_rule") or [])]
-                print(f"[OK] 初始化观看会话: {state.target.target_name} 房间 {state.target.room_id}")
-            except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
-                state.failed_times += 1
-                print(f"[WARN] 初始化观看会话失败: {state.target.target_name} 房间 {state.target.room_id} - {exc}")
+                continue
 
-        total_rounds = watch_minutes * int(WATCH_HEARTBEAT_INTERVAL / WATCH_LOG_INTERVAL)
-        for round_index in range(total_rounds):
-            active_states = [
-                state
-                for state in states
-                if state.failed_times < WATCH_FAILURE_THRESHOLD
-                and state.timestamp > 0
-                and state.secret_key
-                and state.secret_rule
-            ]
-            if not active_states:
-                print("[WARN] 所有房间的观看链路都已连续失败，提前结束观看任务")
-                break
+            room_budget = min(session_minutes, daily_target_minutes - watched_today)
+            added_minutes, room_reports = self.watch_room(
+                target,
+                room_budget,
+                watched_today,
+                daily_target_minutes,
+            )
+            total_reports += room_reports
+            if added_minutes > 0:
+                watched_rooms += 1
+            break
 
-            round_start = time.monotonic()
-            for state_index, state in enumerate(active_states, start=1):
-                try:
-                    next_watch_seconds = state.watch_seconds + int(WATCH_LOG_INTERVAL)
-                    self.client.report_watch_log(
-                        state.target,
-                        player_guid=state.player_guid,
-                        player_session_id=state.player_session_id,
-                        watch_seconds=next_watch_seconds,
-                    )
-                    state.watch_seconds = next_watch_seconds
-                    if state.watch_seconds % int(WATCH_HEARTBEAT_INTERVAL) == 0:
-                        response = self.client.send_watch_heartbeat(
-                            state.target,
-                            device_id=state.device_id,
-                            seq_id=state.heartbeat_count + 1,
-                            session_uuid=state.session_uuid,
-                            timestamp=state.timestamp,
-                            secret_key=state.secret_key,
-                            secret_rule=state.secret_rule,
-                        )
-                        state.timestamp = int(response.get("timestamp", 0) or 0)
-                        state.secret_key = str(response.get("secret_key", "") or "")
-                        state.secret_rule = [
-                            int(rule)
-                            for rule in (response.get("secret_rule") or [])
-                        ]
-                        state.heartbeat_count += 1
-                        print(
-                            f"[OK] 观看心跳 {state.heartbeat_count}/{watch_minutes}: "
-                            f"{state.target.target_name} 房间 {state.target.room_id} "
-                            f"(累计 {state.watch_seconds // 60} 分钟)"
-                        )
-
-                    state.failed_times = 0
-                except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
-                    state.failed_times += 1
-                    print(
-                        f"[WARN] 观看上报失败: {state.target.target_name} 房间 {state.target.room_id} "
-                        f"({state.failed_times}/{WATCH_FAILURE_THRESHOLD}) - {exc}"
-                    )
-
-                if state_index < len(active_states):
-                    time.sleep(WATCH_REQUEST_GAP)
-
-            if round_index + 1 < total_rounds:
-                elapsed = time.monotonic() - round_start
-                wait_seconds = max(0.0, WATCH_LOG_INTERVAL - elapsed)
-                time.sleep(wait_seconds)
-
-        finished_rooms = sum(
-            1 for state in states if state.watch_seconds >= watch_minutes * 60
-        )
-        total_reports = sum((state.watch_seconds // int(WATCH_LOG_INTERVAL)) + state.heartbeat_count for state in states)
         print(
-            f"[INFO] 观看任务完成，达成 {finished_rooms}/{len(states)} 个房间，"
+            f"[INFO] 观看任务完成，本轮观看 {watched_rooms} 个房间，"
+            f"单次目标 {session_minutes} 分钟，"
             f"共发送 {total_reports} 次观看上报"
         )
-        return finished_rooms, total_reports
+        return watched_rooms, total_reports
 
     def run(self, task_config: TaskConfig) -> None:
         self.client.ensure_main_site_cookie()
@@ -244,7 +375,9 @@ class BiliLiveService:
             )
 
             if task_config.like_count > 0:
-                if not target.is_living:
+                if self.state_store.is_done(target.room_id, "like_done"):
+                    print(f"[INFO] 房间 {target.room_id} 今日已完成点赞，跳过")
+                elif not target.is_living:
                     print(f"[INFO] 房间 {target.room_id} 当前未开播，跳过点赞")
                 else:
                     self.like_room_multiple(
@@ -257,20 +390,26 @@ class BiliLiveService:
                     )
                     room_like_success += task_config.like_count
                     total_like_success += task_config.like_count
+                    self.state_store.mark_done(target.room_id, "like_done")
 
             room_danmaku_success = 0
-            for danmaku_index in range(task_config.danmaku_count):
-                message = choose_message(task_config.danmaku_messages, danmaku_index)
-                self.client.send_danmaku(target.room_id, message)
-                room_danmaku_success += 1
-                total_danmaku_success += 1
-                print(f"[OK] 弹幕 {danmaku_index + 1}/{task_config.danmaku_count}: {message}")
-                wait_seconds = random.uniform(
-                    task_config.danmaku_interval_min,
-                    task_config.danmaku_interval_max,
-                )
-                print(f"[INFO] 等待 {wait_seconds:.1f} 秒后继续发送")
-                time.sleep(wait_seconds)
+            if self.state_store.is_done(target.room_id, "danmaku_done"):
+                print(f"[INFO] 房间 {target.room_id} 今日已完成弹幕，跳过")
+            else:
+                for danmaku_index in range(task_config.danmaku_count):
+                    message = choose_message(task_config.danmaku_messages, danmaku_index)
+                    self.client.send_danmaku(target.room_id, message)
+                    room_danmaku_success += 1
+                    total_danmaku_success += 1
+                    print(f"[OK] 弹幕 {danmaku_index + 1}/{task_config.danmaku_count}: {message}")
+                    wait_seconds = random.uniform(
+                        task_config.danmaku_interval_min,
+                        task_config.danmaku_interval_max,
+                    )
+                    print(f"[INFO] 等待 {wait_seconds:.1f} 秒后继续发送")
+                    time.sleep(wait_seconds)
+                if task_config.danmaku_count > 0:
+                    self.state_store.mark_done(target.room_id, "danmaku_done")
 
             print(
                 f"[INFO] 房间完成: {target.target_name}，"
@@ -280,6 +419,7 @@ class BiliLiveService:
         watched_rooms, total_watch_reports = self.watch_live_rooms(
             targets,
             task_config.watch_minutes,
+            task_config.watch_session_minutes,
         )
 
         if (
@@ -320,7 +460,8 @@ def main() -> int:
         validate_task_config(task_config)
 
         client = BiliLiveClient(cookie_string=task_config.cookie)
-        service = BiliLiveService(client)
+        state_store = DailyTaskStateStore(config_path.with_name("task_state.json"))
+        service = BiliLiveService(client, state_store)
         service.run(task_config)
         return 0
     except requests.HTTPError as exc:

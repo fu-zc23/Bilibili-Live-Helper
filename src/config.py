@@ -19,7 +19,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--like-click-time", type=int, help="兼容旧配置，表示每次请求点赞数")
     parser.add_argument("--like-count", type=int, help="点赞总次数")
     parser.add_argument("--like-batch-size", type=int, help="每次请求点赞数，建议 1-10")
-    parser.add_argument("--watch-minutes", type=int, help="每个开播房间观看多少分钟，0 表示关闭")
+    parser.add_argument("--watch-minutes", type=int, help="每个房间当天目标观看分钟数，0 表示关闭")
+    parser.add_argument("--watch-session-minutes", type=int, help="单次运行最多连续观看多少分钟")
     parser.add_argument("--login", action="store_true", help="强制执行扫码登录并保存 Cookie")
     parser.add_argument(
         "--run-after-login",
@@ -47,6 +48,8 @@ def load_config_from_args(args: argparse.Namespace) -> dict:
         config["like_batch_size"] = args.like_batch_size
     if args.watch_minutes is not None:
         config["watch_minutes"] = args.watch_minutes
+    if args.watch_session_minutes is not None:
+        config["watch_session_minutes"] = args.watch_session_minutes
 
     return config
 
@@ -63,6 +66,7 @@ def parse_task_config(config: dict) -> TaskConfig:
         like_interval_min=float(config.get("like_interval_min", 1.5)),
         like_interval_max=float(config.get("like_interval_max", 3)),
         watch_minutes=int(config.get("watch_minutes", 15)),
+        watch_session_minutes=int(config.get("watch_session_minutes", 60)),
     )
 
 
@@ -73,8 +77,12 @@ def validate_task_config(task_config: TaskConfig) -> None:
         raise BiliLiveError("like_count 不能小于 0")
     if task_config.watch_minutes < 0:
         raise BiliLiveError("watch_minutes 不能小于 0")
+    if task_config.watch_session_minutes < 0:
+        raise BiliLiveError("watch_session_minutes 不能小于 0")
     if task_config.like_batch_size <= 0:
         raise BiliLiveError("like_batch_size 必须大于 0")
+    if task_config.watch_minutes > 0 and task_config.watch_session_minutes <= 0:
+        raise BiliLiveError("开启观看任务时，watch_session_minutes 必须大于 0")
     if task_config.danmaku_count > 0 and not task_config.danmaku_messages:
         raise BiliLiveError("需要发送弹幕时，danmaku_messages 不能为空")
     if task_config.danmaku_interval_min <= 0 or task_config.danmaku_interval_max <= 0:
