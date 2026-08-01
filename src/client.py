@@ -21,7 +21,7 @@ from .constants import (
     WATCH_WEB_LOCATION,
 )
 from .exceptions import BiliLiveError
-from .models import TargetRoom
+from .models import MedalTaskInfo, TargetRoom
 from .utils import parse_cookie_string
 
 
@@ -214,6 +214,52 @@ class BiliLiveClient:
         if not isinstance(medals, list):
             raise BiliLiveError("粉丝牌列表格式异常")
         return medals
+
+    def get_activated_medal_info(self, target_id: int) -> dict[str, Any]:
+        """获取指定主播的已佩戴粉丝勋章信息及亲密度任务列表"""
+        payload = self.request(
+            "GET",
+            "https://api.live.bilibili.com/xlive/app-ucenter/v1/fansMedal/GetActivatedMedalInfo",
+            params={
+                "platform": "pc",
+                "target_id": target_id,
+                "web_location": "444.260",
+            },
+            headers=self.live_headers(),
+        )
+        return self.expect_code_zero(payload, "获取勋章任务信息失败")
+
+    @staticmethod
+    def parse_medal_tasks(medal_data: dict[str, Any]) -> tuple[bool, list[MedalTaskInfo]]:
+        """从 API 返回数据中解析任务列表"""
+        is_lighted = bool(medal_data.get("is_lighted", False))
+        raw_tasks = medal_data.get("task_info") or []
+        if not isinstance(raw_tasks, list):
+            return is_lighted, []
+
+        tasks: list[MedalTaskInfo] = []
+        for item in raw_tasks:
+            sub_title = str(item.get("sub_title", ""))
+            daily_limit, daily_current = BiliLiveClient._parse_task_progress(sub_title)
+            tasks.append(MedalTaskInfo(
+                jump_type=str(item.get("jump_type", "")),
+                title=str(item.get("title", "")),
+                sub_title=sub_title,
+                add_text=str(item.get("add_text", "")),
+                is_done=bool(item.get("is_done", False)),
+                daily_limit=daily_limit,
+                daily_current=daily_current,
+            ))
+        return is_lighted, tasks
+
+    @staticmethod
+    def _parse_task_progress(sub_title: str) -> tuple[int, int]:
+        """从 "每日上限 7/10" 中解析出 (10, 7)"""
+        import re
+        m = re.search(r"(\d+)\s*/\s*(\d+)", sub_title)
+        if m:
+            return int(m.group(2)), int(m.group(1))
+        return 0, 0
 
     def get_wbi_keys(self) -> tuple[str, str]:
         if self._wbi_keys is not None:

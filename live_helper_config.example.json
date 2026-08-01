@@ -7,13 +7,10 @@
     "(｀・ω・´).",
     "(〜￣△￣)〜."
   ],
-  "danmaku_count": 10,
   "danmaku_interval_min": 8,
   "danmaku_interval_max": 12,
-  "like_count": 300,
   "like_batch_size": 10,
   "like_interval_min": 1.5,
   "like_interval_max": 3,
-  "watch_minutes": 150,
   "watch_session_minutes": 30
 }
