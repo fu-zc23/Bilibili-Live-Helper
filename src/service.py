@@ -74,10 +74,6 @@ class BiliLiveService:
     def __init__(self, client: BiliLiveClient) -> None:
         self.client = client
 
-    @staticmethod
-    def _is_time_check_failed(exc: Exception) -> bool:
-        return "time check failed" in str(exc).lower()
-
     def refresh_watch_session(self, state: WatchState, *, action: str) -> bool:
         try:
             response = self.client.enter_room_heartbeat(
@@ -243,8 +239,7 @@ class BiliLiveService:
                 except (requests.RequestException, BiliLiveError, TypeError, ValueError) as exc:
                     state.failed_times += 1
                     print(f"[WARN] 观看心跳失败: {state.target.target_name} - {exc}")
-                    if self._is_time_check_failed(exc):
-                        self.refresh_watch_session(state, action="重建")
+                    self.refresh_watch_session(state, action="重建")
 
             if round_index + 1 < total_rounds:
                 elapsed = time.monotonic() - round_start

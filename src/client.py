@@ -7,8 +7,10 @@ import time
 from typing import Any
 from urllib.parse import quote, urlencode
 
-import requests
 import qrcode
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .constants import (
     DEFAULT_HEADERS,
@@ -31,6 +33,17 @@ class BiliLiveClient:
         self.session.headers.update(DEFAULT_HEADERS)
         self.timeout = timeout
         self._wbi_keys: tuple[str, str] | None = None
+
+        # 避免服务器 keep-alive 断开导致 RemoteDisconnected
+        adapter = HTTPAdapter(
+            max_retries=Retry(
+                total=2,
+                backoff_factor=0.3,
+                status_forcelist=[500, 502, 503, 504],
+                allowed_methods=None,
+            ),
+        )
+        self.session.mount("https://", adapter)
 
         cookie_dict = parse_cookie_string(cookie_string)
         for key, value in cookie_dict.items():
