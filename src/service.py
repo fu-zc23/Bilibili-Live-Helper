@@ -352,6 +352,7 @@ class BiliLiveService:
                 )
                 total_like_success += like_needed
 
+            time.sleep(random.uniform(1.0, 3.0))  # 房间间隔，避免过快切换
             print(
                 f"[INFO] 房间完成: {target.target_name}，"
                 f"弹幕 {total_danmaku_success} 条，点赞 {total_like_success} 次"
