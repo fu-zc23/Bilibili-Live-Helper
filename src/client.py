@@ -23,6 +23,7 @@ from .constants import (
     WATCH_WEB_LOCATION,
 )
 from .exceptions import BiliLiveError
+from .logger import log
 from .models import MedalTaskInfo, TargetRoom
 from .utils import parse_cookie_string
 
@@ -180,10 +181,10 @@ class BiliLiveClient:
     def qr_login(self) -> str:
         login_url, qrcode_key = self.generate_login_qrcode()
 
-        print("[INFO] 已生成 B 站扫码登录二维码")
+        log("INFO", "已生成 B 站扫码登录二维码")
         print(self.render_terminal_qr(login_url))
-        print(f"[INFO] 登录链接: {login_url}")
-        print("[INFO] 请使用 B 站 App 扫码并确认登录")
+        log("INFO", f"登录链接: {login_url}")
+        log("INFO", "请使用 B 站 App 扫码并确认登录")
         for poll_index in range(LOGIN_MAX_POLLS):
             status_code, message = self.poll_login_status(qrcode_key)
             if status_code == 0:
@@ -191,14 +192,14 @@ class BiliLiveClient:
                 cookie_string = self.cookie_string()
                 if not cookie_string:
                     raise BiliLiveError("扫码成功，但未提取到 Cookie")
-                print("[OK] 扫码登录成功")
+                log("OK", "扫码登录成功")
                 return cookie_string
 
             if status_code == 86038:
                 raise BiliLiveError("二维码已失效，请重新运行登录")
 
             readable = message or "等待扫码中"
-            print(f"[INFO] 登录状态 {poll_index + 1}/{LOGIN_MAX_POLLS}: {readable}")
+            log("INFO", f"登录状态 {poll_index + 1}/{LOGIN_MAX_POLLS}: {readable}")
             time.sleep(LOGIN_POLL_INTERVAL)
 
         raise BiliLiveError("登录超时，请重新运行后扫码")
@@ -411,7 +412,7 @@ class BiliLiveClient:
             except (requests.RequestException, BiliLiveError, KeyError, ValueError) as exc:
                 if first_error is None:
                     first_error = exc
-                print(f"[WARN] 跳过粉丝牌目标 {target_id}: {exc}")
+                log("WARN", f"跳过粉丝牌目标 {target_id}: {exc}")
                 continue
 
             real_room_id = int(room_info.get("room_id") or room_id_from_space)
@@ -425,7 +426,7 @@ class BiliLiveClient:
                     play_info = self.get_room_play_info(real_room_id)
                     play_url = self.select_play_url(play_info)
                 except (requests.RequestException, BiliLiveError, KeyError, ValueError) as exc:
-                    print(f"[WARN] 获取房间 {real_room_id} 播放流失败: {exc}")
+                    log("WARN", f"获取房间 {real_room_id} 播放流失败: {exc}")
 
             seen_room_ids.add(real_room_id)
             targets.append(
