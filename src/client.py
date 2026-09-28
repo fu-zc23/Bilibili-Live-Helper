@@ -254,26 +254,37 @@ class BiliLiveClient:
         tasks: list[MedalTaskInfo] = []
         for item in raw_tasks:
             sub_title = str(item.get("sub_title", ""))
+            title = str(item.get("title", ""))
             daily_limit, daily_current = BiliLiveClient._parse_task_progress(sub_title)
+            # 熄灭状态: sub_title 为 "仅点亮"，无 X/Y 进度，所需次数在 title 中（如 "发弹幕10次"）
+            is_light_task = daily_limit == 0 and "仅点亮" in sub_title
+            if is_light_task:
+                daily_limit = BiliLiveClient._parse_light_task_count(title)
             tasks.append(MedalTaskInfo(
                 jump_type=str(item.get("jump_type", "")),
-                title=str(item.get("title", "")),
+                title=title,
                 sub_title=sub_title,
                 add_text=str(item.get("add_text", "")),
                 is_done=bool(item.get("is_done", False)),
                 daily_limit=daily_limit,
                 daily_current=daily_current,
+                is_light_task=is_light_task,
             ))
         return is_lighted, tasks
 
     @staticmethod
     def _parse_task_progress(sub_title: str) -> tuple[int, int]:
         """从 "每日上限 7/10" 中解析出 (10, 7)"""
-        import re
         m = re.search(r"(\d+)\s*/\s*(\d+)", sub_title)
         if m:
             return int(m.group(2)), int(m.group(1))
         return 0, 0
+
+    @staticmethod
+    def _parse_light_task_count(title: str) -> int:
+        """从熄灭状态任务标题 "发弹幕10次" 中解析出所需次数"""
+        m = re.search(r"(\d+)\s*次", title)
+        return int(m.group(1)) if m else 0
 
     def get_wbi_keys(self) -> tuple[str, str]:
         if self._wbi_keys is not None:

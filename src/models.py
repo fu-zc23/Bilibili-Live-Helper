@@ -6,11 +6,12 @@ class MedalTaskInfo:
     """单个亲密度任务的信息，来自 API 返回的 task_info 条目"""
     jump_type: str          # 任务类型: feedLight / watchLive / sendGift / sendDanmu / like
     title: str              # 任务名称
-    sub_title: str          # 进度文本，如 "每日上限 7/10"
+    sub_title: str          # 进度文本，如 "每日上限 7/10"；熄灭状态为 "仅点亮"
     add_text: str           # 奖励文本，如 "亲密度+1"
     is_done: bool           # 是否已完成
-    daily_limit: int = 0    # 每日总上限
+    daily_limit: int = 0    # 每日总上限；点亮任务为点亮所需次数
     daily_current: int = 0  # 当日已完成次数
+    is_light_task: bool = False  # 熄灭状态下的点亮任务（sub_title 为 "仅点亮"）
 
 
 @dataclass(frozen=True)

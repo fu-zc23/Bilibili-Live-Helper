@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import random
 import time
@@ -105,7 +106,7 @@ class BiliLiveService:
         like_batch_size: int,
         like_interval_min: float,
         like_interval_max: float,
-    ) -> None:
+    ) -> int:
         batch_size = max(1, min(like_batch_size, 10))
         total_requests = (like_count + batch_size - 1) // batch_size
         completed_likes = 0
@@ -121,6 +122,92 @@ class BiliLiveService:
             wait_seconds = random.uniform(like_interval_min, like_interval_max)
             log("INFO", f"等待 {wait_seconds:.1f} 秒后继续点赞")
             time.sleep(wait_seconds)
+        return completed_likes
+
+    def refresh_target_medal(self, target: TargetRoom) -> TargetRoom:
+        """重新获取勋章任务信息（点亮后任务列表会从"仅点亮"恢复为每日任务）"""
+        try:
+            medal_data = self.client.get_activated_medal_info(target.anchor_id)
+            is_lighted, tasks = self.client.parse_medal_tasks(medal_data)
+            return replace(target, medal_is_lighted=is_lighted, tasks=tasks)
+        except (requests.RequestException, BiliLiveError, ValueError) as exc:
+            log("WARN", f"重新获取 {target.target_name} 任务信息失败: {exc}")
+            return target
+
+    def send_danmaku_count(
+        self,
+        target: TargetRoom,
+        count: int,
+        task_config: TaskConfig,
+        label: str = "弹幕",
+    ) -> int:
+        if count <= 0:
+            return 0
+        if not task_config.danmaku_messages:
+            log("WARN", "未配置弹幕消息，跳过弹幕")
+            return 0
+
+        sent = 0
+        for i in range(count):
+            message = choose_message(task_config.danmaku_messages, i)
+            try:
+                self.client.send_danmaku(target.room_id, message)
+                sent += 1
+                log("OK", f"{label} {i + 1}/{count}: {message}")
+            except (requests.RequestException, BiliLiveError) as exc:
+                log("WARN", f"{label}发送失败: {exc}")
+                break
+            if i + 1 < count:
+                wait = random.uniform(
+                    task_config.danmaku_interval_min,
+                    task_config.danmaku_interval_max,
+                )
+                log("INFO", f"等待 {wait:.1f} 秒")
+                time.sleep(wait)
+        return sent
+
+    def light_up_medal(self, target: TargetRoom, task_config: TaskConfig) -> tuple[TargetRoom, int, int]:
+        """粉丝牌熄灭时，按接口提示的次数通过发弹幕或点赞点亮；返回刷新后的 target 和实际完成数"""
+        light_danmaku = _find_task(target.tasks, "sendDanmu")
+        light_like = _find_task(target.tasks, "like")
+        danmaku_needed = light_danmaku.daily_limit if light_danmaku and light_danmaku.is_light_task and not light_danmaku.is_done else 0
+        like_needed = light_like.daily_limit if light_like and light_like.is_light_task and not light_like.is_done else 0
+
+        if danmaku_needed <= 0 and like_needed <= 0:
+            log("WARN", f"粉丝牌已熄灭，但未能从任务信息解析点亮次数: {target.target_name}")
+            return target, 0, 0
+
+        log("INFO", f"粉丝牌已熄灭，需 发弹幕 {danmaku_needed} 次或点赞 {like_needed} 次点亮")
+
+        danmaku_sent = 0
+        if danmaku_needed > 0:
+            danmaku_sent = self.send_danmaku_count(target, danmaku_needed, task_config, label="点亮弹幕")
+            target = self.refresh_target_medal(target)
+            if target.medal_is_lighted:
+                log("OK", f"粉丝牌已点亮: {target.target_name}")
+                return target, danmaku_sent, 0
+
+        likes_sent = 0
+        if like_needed > 0:
+            if not target.is_living:
+                log("INFO", f"弹幕未能点亮，点赞 {like_needed} 次可点亮，但房间未开播，等待下轮")
+                return target, danmaku_sent, 0
+            try:
+                log("INFO", f"弹幕未能点亮，尝试点赞 {like_needed} 次点亮")
+                likes_sent = self.like_room_multiple(
+                    target.room_id,
+                    target.anchor_id,
+                    like_needed,
+                    task_config.like_batch_size,
+                    task_config.like_interval_min,
+                    task_config.like_interval_max,
+                )
+            except (requests.RequestException, BiliLiveError) as exc:
+                log("WARN", f"点亮点赞失败: {exc}")
+            target = self.refresh_target_medal(target)
+            if target.medal_is_lighted:
+                log("OK", f"粉丝牌已点亮: {target.target_name}")
+        return target, danmaku_sent, likes_sent
 
     def watch_live_rooms(
         self,
@@ -298,51 +385,46 @@ class BiliLiveService:
                 f"{target.target_name} 房间 {target.room_id} ({room_status}) ===",
             )
 
+            # --- 熄灭粉丝牌：先执行点亮任务 ---
+            if not target.medal_is_lighted:
+                target, light_danmaku, light_likes = self.light_up_medal(target, task_config)
+                targets[target_index - 1] = target  # 回写，观看任务使用刷新后的任务列表
+                total_danmaku_success += light_danmaku
+                total_like_success += light_likes
+
             # --- 弹幕任务 ---
             danmaku_task = _find_task(target.tasks, "sendDanmu")
             danmaku_needed = 0
-            if danmaku_task and not danmaku_task.is_done:
+            if danmaku_task and not danmaku_task.is_done and not danmaku_task.is_light_task:
                 danmaku_needed = max(0, danmaku_task.daily_limit - danmaku_task.daily_current)
 
             if danmaku_needed <= 0:
-                status = f"已完成 ({danmaku_task.daily_current}/{danmaku_task.daily_limit})" if danmaku_task else "无任务"
-                log("INFO", f"弹幕任务 {status}，跳过")
+                if danmaku_task and danmaku_task.is_light_task:
+                    log("INFO", "弹幕点亮任务未完成，等待下轮重试")
+                else:
+                    status = f"已完成 ({danmaku_task.daily_current}/{danmaku_task.daily_limit})" if danmaku_task else "无任务"
+                    log("INFO", f"弹幕任务 {status}，跳过")
             else:
                 log("INFO", f"弹幕任务还需 {danmaku_needed} 条 (上限 {danmaku_task.daily_limit})")
-                if not task_config.danmaku_messages:
-                    log("WARN", "未配置弹幕消息，跳过弹幕")
-                else:
-                    for i in range(danmaku_needed):
-                        message = choose_message(task_config.danmaku_messages, i)
-                        try:
-                            self.client.send_danmaku(target.room_id, message)
-                            total_danmaku_success += 1
-                            log("OK", f"弹幕 {i+1}/{danmaku_needed}: {message}")
-                        except (requests.RequestException, BiliLiveError) as exc:
-                            log("WARN", f"弹幕发送失败: {exc}")
-                            break
-                        if i + 1 < danmaku_needed:
-                            wait = random.uniform(
-                                task_config.danmaku_interval_min,
-                                task_config.danmaku_interval_max,
-                            )
-                            log("INFO", f"等待 {wait:.1f} 秒")
-                            time.sleep(wait)
+                total_danmaku_success += self.send_danmaku_count(target, danmaku_needed, task_config)
 
             # --- 点赞任务 ---
             like_task = _find_task(target.tasks, "like")
             like_needed = 0
-            if like_task and not like_task.is_done:
+            if like_task and not like_task.is_done and not like_task.is_light_task:
                 like_needed = max(0, like_task.daily_limit - like_task.daily_current) * 30
 
             if like_needed <= 0:
-                status = f"已完成 ({like_task.daily_current}/{like_task.daily_limit})" if like_task else "无任务"
-                log("INFO", f"点赞任务 {status}，跳过")
+                if like_task and like_task.is_light_task:
+                    log("INFO", "点赞点亮任务未完成，等待下轮重试")
+                else:
+                    status = f"已完成 ({like_task.daily_current}/{like_task.daily_limit})" if like_task else "无任务"
+                    log("INFO", f"点赞任务 {status}，跳过")
             elif not target.is_living:
                 log("INFO", f"点赞任务还需 {like_needed} 赞，但房间未开播，跳过")
             else:
                 log("INFO", f"点赞任务还需 {like_needed} 赞 (上限 {like_task.daily_limit * 30})")
-                self.like_room_multiple(
+                total_like_success += self.like_room_multiple(
                     target.room_id,
                     target.anchor_id,
                     like_needed,
@@ -350,7 +432,6 @@ class BiliLiveService:
                     task_config.like_interval_min,
                     task_config.like_interval_max,
                 )
-                total_like_success += like_needed
 
             time.sleep(random.uniform(1.0, 3.0))  # 房间间隔，避免过快切换
             log(
