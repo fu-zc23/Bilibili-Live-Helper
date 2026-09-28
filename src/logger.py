@@ -16,6 +16,6 @@ def log(level: str, message: str = "") -> None:
     stream = sys.stderr if level == "ERROR" else sys.stdout
     timestamp = _now()
     if message:
-        print(f"[{timestamp}] [{level}] {message}", file=stream)
+        print(f"[{timestamp}] [{level}] {message}", file=stream, flush=True)
     else:
-        print(f"[{timestamp}] [{level}]", file=stream)
+        print(f"[{timestamp}] [{level}]", file=stream, flush=True)
