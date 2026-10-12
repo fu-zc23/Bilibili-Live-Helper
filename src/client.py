@@ -229,6 +229,85 @@ class BiliLiveClient:
             raise BiliLiveError("粉丝牌列表格式异常")
         return medals
 
+    def get_followings(self) -> list[dict[str, Any]]:
+        """返回关注列表（主站接口，分页拉全），条目含 uname/mid，不含直播间信息"""
+        users: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for page in range(1, 20):
+            payload = self.request(
+                "GET",
+                "https://api.bilibili.com/x/relation/followings",
+                params={
+                    "vmid": self.uid,
+                    "order": "desc",
+                    "order_type": "attention",
+                    "fnval": 0,
+                    "pn": page,
+                    "ps": 50,
+                },
+                headers=self.main_headers(),
+            )
+            data = payload.get("data") or {}
+            page_users = data.get("list") or []
+            if not page_users:
+                break
+            for u in page_users:
+                mid = int(u.get("mid", 0) or 0)
+                if mid <= 0 or mid in seen:
+                    continue
+                seen.add(mid)
+                users.append(u)
+            if page * 50 >= int(data.get("total", 0) or 0):
+                break
+        return users
+
+    def get_user_room_id(self, mid: int) -> int:
+        """通过空间信息获取用户直播间号；无直播间返回 0，请求失败抛异常（不缓存）"""
+        space_info = self.get_space_info(mid)
+        live_room = space_info.get("live_room") or {}
+        return int(live_room.get("roomid", 0) or 0)
+
+    def get_anchor_lottery(self, room_id: int) -> dict[str, Any] | None:
+        """查询房间进行中的天选时刻；无进行中天选时返回 None"""
+        payload = self.request(
+            "GET",
+            "https://api.live.bilibili.com/xlive/lottery-interface/v1/Anchor/Check",
+            params={"roomid": room_id},
+            headers=self.live_headers(room_id),
+        )
+        data = self.expect_code_zero(payload, "获取天选时刻信息失败")
+        if int(data.get("status", 0) or 0) != 1 or int(data.get("lot_status", 0) or 0) != 0:
+            return None
+        if not data.get("id"):
+            return None
+        return data
+
+    def join_anchor_lottery(self, room_id: int, lottery_id: int) -> dict[str, Any]:
+        """参与天选时刻（弹幕口令类，无需真实发送口令弹幕）"""
+        payload = self.request(
+            "POST",
+            "https://api.live.bilibili.com/xlive/lottery-interface/v1/Anchor/Join",
+            data={
+                "id": lottery_id,
+                "platform": "pc",
+                "room_id": room_id,
+                "spm_id": "444.8.interaction.anchor_draw_auto",
+                "jump_from_str": "",
+                "session_id": "",
+                "csrf_token": self.csrf,
+                "csrf": self.csrf,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                **self.live_headers(room_id),
+            },
+        )
+        if payload.get("code") != 0:
+            raise BiliLiveError(
+                f"参与天选失败: {payload.get('message', '未知错误')} (code={payload.get('code')})"
+            )
+        return payload.get("data") or {}
+
     def get_activated_medal_info(self, target_id: int) -> dict[str, Any]:
         """获取指定主播的已佩戴粉丝勋章信息及亲密度任务列表"""
         payload = self.request(
