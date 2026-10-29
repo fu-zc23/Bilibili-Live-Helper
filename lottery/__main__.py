@@ -22,6 +22,8 @@ STATE_PATH = Path(__file__).parent.parent / "lottery_state.json"
 # 已参与记录保留天数（超过后清理，防止 state 无限增长）
 STATE_TTL_DAYS = 7
 ROOM_QUERY_GAP = 0.3  # 房间间请求间隔（秒）
+# 无直播间缓存重查间隔天数
+ZERO_ROOM_RECHECK_DAYS = 1
 
 
 def load_state() -> dict:
@@ -52,41 +54,67 @@ def prune_state(state: dict) -> None:
 
 
 def resolve_follow_rooms(client: BiliLiveClient, state: dict) -> list[tuple[str, int, int]]:
-    """关注列表 → [(uname, mid, room_id), ...]。房间号缓存于 state，仅新增关注触发空间查询"""
+    """关注列表 → [(uname, mid, room_id), ...]。
+    房间号缓存于 state：新关注触发空间查询；缓存为 0 的每隔 ZERO_ROOM_RECHECK_DAYS 重查一次。"""
     rooms_cache: dict = state.setdefault("rooms", {})
+    recheck_at: dict = state.setdefault("zero_recheck_at", {})
     users = client.get_followings()
     if not users:
         return []
 
     resolved: list[tuple[str, int, int]] = []
     new_entries = 0
+    rechecked = 0
+    recheck_cutoff = time.time() - ZERO_ROOM_RECHECK_DAYS * 86400
     for u in users:
         uname = str(u.get("uname", "") or "")
         mid = int(u.get("mid", 0) or 0)
         if mid <= 0:
             continue
-        cached = rooms_cache.get(str(mid))
+        key = str(mid)
+        cached = rooms_cache.get(key)
         if cached is not None:
             room_id = int(cached)
             if room_id > 0:
                 resolved.append((uname, mid, room_id))
+            elif float(recheck_at.get(key, 0) or 0) <= recheck_cutoff:
+                if _recheck_room(client, rooms_cache, recheck_at, uname, mid):
+                    rechecked += 1
+                    resolved.append((uname, mid, int(rooms_cache[key])))
             continue
 
-        # 新关注的用户: 查空间信息解析房间号
-        # 接口明确返回无直播间才缓存 0；请求失败则跳过，下轮重试（避免临时风控被永久缓存）
-        try:
-            room_id = client.get_user_room_id(mid)
-        except (requests.RequestException, BiliLiveError) as exc:
-            log("WARN", f"解析 {uname}({mid}) 房间号失败，下轮重试: {exc}")
-            continue
-        rooms_cache[str(mid)] = room_id
-        new_entries += 1
-        if room_id > 0:
-            resolved.append((uname, mid, room_id))
+        if _recheck_room(client, rooms_cache, recheck_at, uname, mid):
+            new_entries += 1
+            resolved.append((uname, mid, int(rooms_cache[key])))
 
     if new_entries:
-        log("INFO", f"解析 {new_entries} 个新增关注的房间号，累计有直播间的关注 {len(resolved)} 个")
+        log("INFO", f"解析 {new_entries} 个新增关注的房间号")
+    if rechecked:
+        log("INFO", f"重查 {rechecked} 个缓存为 0 的关注，现有直播间的关注 {len(resolved)} 个")
     return resolved
+
+
+def _recheck_room(
+    client: BiliLiveClient,
+    rooms_cache: dict,
+    recheck_at: dict,
+    uname: str,
+    mid: int,
+) -> bool:
+    """查空间信息解析房间号并写缓存。返回是否解析到有效房间（>0）。
+    0 缓存记录下次重查时间；请求失败不缓存、推迟到下轮。"""
+    try:
+        room_id = client.get_user_room_id(mid)
+    except (requests.RequestException, BiliLiveError) as exc:
+        log("WARN", f"解析 {uname}({mid}) 房间号失败，下轮重试: {exc}")
+        return False
+    key = str(mid)
+    rooms_cache[key] = room_id
+    if room_id > 0:
+        recheck_at.pop(key, None)
+        return True
+    recheck_at[key] = time.time()
+    return False
 
 
 def should_join(lottery: dict) -> tuple[bool, str]:
